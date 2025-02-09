@@ -16,15 +16,14 @@ class Streamer:
 
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
-        # Your code goes here!  The code below should be changed!
-
-        # for now I'm just sending the raw application-level data in one UDP payload
-        self.socket.sendto(data_bytes, (self.dst_ip, self.dst_port))
+        # Break data into chunks of max 1472 bytes (max UDP payload size)
+        chunk_size = 1472
+        for i in range(0, len(data_bytes), chunk_size):
+            chunk = data_bytes[i:i + chunk_size]
+            self.socket.sendto(chunk, (self.dst_ip, self.dst_port))
 
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
-        # your code goes here!  The code below should be changed!
-        
         # this sample code just calls the recvfrom method on the LossySocket
         data, addr = self.socket.recvfrom()
         # For now, I'll just pass the full UDP payload to the app
