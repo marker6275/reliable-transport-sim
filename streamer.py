@@ -1,251 +1,163 @@
-# do not import anything else from loss_socket besides LossyUDP
 from lossy_socket import LossyUDP
-# do not import anything else from socket except INADDR_ANY
 from socket import INADDR_ANY
-
-import hashlib
 import struct
-import time
 from concurrent.futures import ThreadPoolExecutor
+import time
+import hashlib
+import threading
 
-###################################################
-# Helper function to compute MD5
-###################################################
-def compute_md5(data: bytes) -> bytes:
-    """Return the 16-byte MD5 digest of 'data'."""
-    md5 = hashlib.md5()
-    md5.update(data)
-    return md5.digest()
-
-###################################################
-# Constants for your packet format
-###################################################
-HEADER_SIZE_WITHOUT_MD5 = 1 + 4  # 1 byte packet_type + 4 bytes seq_num
-MD5_SIZE = 16  # We store 16-byte MD5 at the front
-MAX_UDP_PAYLOAD = 1472
 
 class Streamer:
     def __init__(self, dst_ip, dst_port, src_ip=INADDR_ANY, src_port=0):
+        """Default values listen on all network interfaces, chooses a random source port,
+           and does not introduce any simulated packet loss."""
         self.socket = LossyUDP()
         self.socket.bind((src_ip, src_port))
         self.dst_ip = dst_ip
         self.dst_port = dst_port
 
-        # Sequence numbers for data
-        self.next_send_seq = 0       # next sequence number for sending
-        self.next_recv_seq = 0       # next sequence number expected for receiving
+        self.next_send_seq = 0
+        self.next_rec_seq = 0
+        self.base_seq = 0
 
-        self.receive_buffer = {}     # store out-of-order data
+        self.rec_buffer = {}
+        self.send_buffer = {}
+
+        self.FIN = False
+        self.FIN_SEQ = None
+        self.FIN_ACK = False
+
         self.closed = False
 
-        # Flags and state for stop-and-wait
-        self.ack_received = False    # indicates we've received ACK for the *current* packet
-        self.last_ack_seq = -1       # which sequence number was last ACKed?
+        self.lock = threading.Lock()
 
-        # FIN handshake states
-        self.fin_sent = False
-        self.fin_acked = False
-        self.received_peer_fin = False
-
-        # Start background listener thread
-        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.executor = ThreadPoolExecutor(max_workers=2)
         self.executor.submit(self.listener)
+        self.executor.submit(self.retransmit)
 
-    ###################################################
-    # Packet Builder / Parser with MD5
-    ###################################################
-    def build_packet(self, packet_type: int, seq_num: int, payload: bytes) -> bytes:
-        """
-        Build the final packet:
-          [16-byte MD5][1-byte packet_type][4-byte seq_num][payload]
-        The MD5 covers everything *after* its own field (i.e., it covers the packet_type, seq_num, payload).
-        """
-        # Build the portion that the MD5 covers
-        # We'll do: (1-byte type) + (4-byte seq) + payload
-        header_without_md5 = struct.pack("!B", packet_type) + struct.pack("!I", seq_num)
-        data_for_md5 = header_without_md5 + payload
-
-        # Compute MD5 of that
-        md5_hash = compute_md5(data_for_md5)
-
-        # Final packet = MD5(16 bytes) + data_for_md5
-        final_packet = md5_hash + data_for_md5
-        return final_packet
-
-    def parse_packet(self, data: bytes):
-        """
-        Parse the packet:
-          data[0:16]   => MD5
-          data[16:17] => packet_type
-          data[17:21] => seq_num
-          data[21:]   => payload
-        Returns: (is_valid, packet_type, seq_num, payload)
-        If invalid MD5, return (False, None, None, None)
-        """
-        if len(data) < MD5_SIZE + HEADER_SIZE_WITHOUT_MD5:
-            # Too short to even read MD5 + type + seq
-            return (False, None, None, None)
-
-        md5_received = data[:MD5_SIZE]
-        rest = data[MD5_SIZE:]  # the part we hashed
-
-        # Recompute MD5 of 'rest'
-        md5_computed = compute_md5(rest)
-        if md5_computed != md5_received:
-            # Corrupted!
-            return (False, None, None, None)
-
-        # If valid, parse out packet_type + seq_num
-        packet_type = rest[0]
-        seq_num = struct.unpack("!I", rest[1:5])[0]
-        payload = rest[5:]
-        return (True, packet_type, seq_num, payload)
-
-    ###################################################
-    # Listener with corruption check
-    ###################################################
     def listener(self):
-        """Continuously receive packets (data, ACK, FIN, FIN_ACK) with MD5 checks."""
         while not self.closed:
             try:
                 data, addr = self.socket.recvfrom()
-                if not data:
-                    continue  # spurious?
+                if not data or len(data) < 21:
+                    continue
+                
+                packet_type = struct.unpack("!B", data[:1])[0]
+                seq_num = struct.unpack("!I", data[1:5])[0]
+                received_hash = data[5:21]
+                payload = data[21:]
+                computed_hash = hashlib.md5(data[:5] + payload).digest()
 
-                # parse and validate MD5
-                is_valid, packet_type, seq_num, payload = self.parse_packet(data)
-                if not is_valid:
-                    # Corrupted => discard, do *not* ACK
+                if received_hash != computed_hash:
                     continue
 
-                # Now proceed with normal logic
-                if packet_type == 0:
-                    # DATA packet
-                    self.receive_buffer[seq_num] = payload
-                    # send ACK
-                    ack_packet = self.build_packet(1, seq_num, b'')
-                    self.socket.sendto(ack_packet, addr)
+                if packet_type == 0: # data
+                    if seq_num not in self.rec_buffer:
+                        self.rec_buffer[seq_num] = payload
+                    header = struct.pack("!BI", 1, seq_num)
+                    ack = header + hashlib.md5(header).digest()
 
-                elif packet_type == 1:
-                    # ACK packet
-                    self.ack_received = True
-                    self.last_ack_seq = seq_num
+                    self.socket.sendto(ack, addr)
+                elif packet_type == 1: # ACK
+                    with self.lock:
+                        if self.FIN_SEQ is not None and seq_num == self.FIN_SEQ:
+                            self.FIN_ACK = True
+                        if seq_num >= self.base_seq:
+                            remove_keys = [key for key in self.send_buffer if key <= seq_num]
+                            for key in remove_keys:
+                                del self.send_buffer[key]
+                            if seq_num >= self.base_seq:
+                                self.base_seq = seq_num + 1
+                elif packet_type == 2: # FIN
+                    header = struct.pack("!BI", 1, seq_num)
+                    ack = header + hashlib.md5(header).digest()
 
-                elif packet_type == 2:
-                    # FIN
-                    self.received_peer_fin = True
-                    # respond with FIN_ACK
-                    fin_ack_packet = self.build_packet(3, seq_num, b'')
-                    self.socket.sendto(fin_ack_packet, addr)
-
-                elif packet_type == 3:
-                    # FIN_ACK
-                    self.fin_acked = True
+                    self.socket.sendto(ack, addr)
+                    self.FIN = True
 
             except Exception as e:
-                if not self.closed:
-                    print("Listener died with error:", e)
+                print(e)
 
-    ###################################################
-    # Sending (Stop-and-wait with corruption check)
-    ###################################################
+    def retransmit(self):
+        while not self.closed:
+            time.sleep(0.01)
+            with self.lock:
+                if self.send_buffer:
+                    earliest_seq = min(self.send_buffer.keys())
+                    _, last_time = self.send_buffer[earliest_seq]
+                    
+                    if time.time() - last_time >= 0.25:
+                        for seq in sorted(self.send_buffer.keys()):
+                            packet, _ = self.send_buffer[seq]
+                            self.send_buffer[seq] = (packet, time.time())
+                            self.socket.sendto(packet, (self.dst_ip, self.dst_port))
+
     def send(self, data_bytes: bytes) -> None:
-        """
-        Stop-and-wait: for each chunk, keep sending until ack is received or we time out (0.25s).
-        Then move to next chunk.
-        Now each packet includes an MD5.
-        """
-        # 16-byte MD5 + 1-byte type + 4-byte seq => 16 + 1 + 4 = 21
-        # so max payload = 1472 - 21 = 1451
-        header_size = MD5_SIZE + HEADER_SIZE_WITHOUT_MD5
-        max_payload = MAX_UDP_PAYLOAD - header_size
+        """Note that data_bytes can be larger than one packet."""
+        max_payload = 1451
 
-        offset = 0
-        while offset < len(data_bytes):
-            chunk = data_bytes[offset : offset + max_payload]
-            offset += max_payload
+        for i in range(0, len(data_bytes), max_payload):
+            chunk = data_bytes[i:i + max_payload]
+            with self.lock:
+                seq_num = self.next_send_seq
+                header = struct.pack("!BI", 0, seq_num)
+                packet = header + hashlib.md5(header + chunk).digest() + chunk
 
-            seq = self.next_send_seq
-            self.next_send_seq += 1
+                self.send_buffer[seq_num] = (packet, time.time())
+                self.next_send_seq += 1
+            self.socket.sendto(packet, (self.dst_ip, self.dst_port))
 
-            # Build data packet (type=0 => data)
-            packet = self.build_packet(0, seq, chunk)
+        while True:
+            with self.lock:
+                if not self.send_buffer:
+                    break
+            time.sleep(0.01)
 
-            # Repeatedly send until we get an ACK or kill signal
-            acked = False
-            while not acked and not self.closed:
-                self.ack_received = False
-                self.last_ack_seq = -1
-                self.socket.sendto(packet, (self.dst_ip, self.dst_port))
-
-                # Wait up to 0.25s for an ACK
-                start_wait = time.time()
-                while time.time() - start_wait < 0.25 and not self.closed:
-                    if self.ack_received and self.last_ack_seq == seq:
-                        acked = True
-                        break
-                    time.sleep(0.01)
-
-                # If we never got the correct ack => loop and resend
-
-            if self.closed:
-                break
-
-    ###################################################
-    # Receiving
-    ###################################################
     def recv(self) -> bytes:
-        """
-        Return the next in-order data (next_recv_seq).
-        Blocks until the next segment arrives, then any contiguous segments after it.
-        """
+        """Blocks (waits) if no data is ready to be read from the connection."""
         assembled = b""
         while True:
-            # Deliver all contiguous data starting at next_recv_seq
-            while self.next_recv_seq in self.receive_buffer:
-                assembled += self.receive_buffer.pop(self.next_recv_seq)
-                self.next_recv_seq += 1
-
-            # If we have something, return it now
-            if assembled:
+            if self.next_rec_seq in self.rec_buffer:
+                while self.next_rec_seq in self.rec_buffer:
+                    assembled += self.rec_buffer.pop(self.next_rec_seq)
+                    self.next_rec_seq += 1
                 return assembled
-
-            # Otherwise, wait briefly for the next chunk
             time.sleep(0.01)
-            if self.closed:
-                # If the socket is closed and we have nothing new, return empty
-                return b""
 
-    ###################################################
-    # Close / Teardown with FIN handshake
-    ###################################################
     def close(self) -> None:
-        """
-        1) Because stop-and-wait ensures data was fully ACKed, we don't re-check data.
-        2) Send FIN repeatedly until FIN_ACK arrives (0.25s timeout).
-        3) Wait until we receive a FIN from the other side.
-        4) Wait 2 seconds.
-        5) Stop the listener (self.closed=True) and self.socket.stoprecv().
-        """
-        # Step 2: Send FIN repeatedly until FIN_ACK arrives
-        fin_seq = 99999999  # any special number, or self.next_send_seq
-        while not self.fin_acked:
-            fin_packet = self.build_packet(2, fin_seq, b'')
-            self.socket.sendto(fin_packet, (self.dst_ip, self.dst_port))
-            start_wait = time.time()
-            while time.time() - start_wait < 0.25:
-                if self.fin_acked:
+        """Cleans up. It should block (wait) until the Streamer is done with all
+           the necessary ACKs and retransmissions"""
+        while True:
+            with self.lock:
+                if not self.send_buffer:
                     break
-                time.sleep(0.01)
-
-        # Step 3: Wait for peer's FIN
-        while not self.received_peer_fin:
             time.sleep(0.01)
 
-        # Step 4: Wait 2 seconds
+        with self.lock:
+            self.FIN_SEQ = self.next_send_seq
+            self.next_send_seq += 1
+            self.FIN_ACK = False
+
+        header = struct.pack("!BI", 2, self.FIN_SEQ)
+        fin = header + hashlib.md5(header).digest()
+
+        while not self.FIN_ACK:
+            self.socket.sendto(fin, (self.dst_ip, self.dst_port))
+            start_time = time.time()
+
+            while time.time() - start_time < 0.25:
+                time.sleep(0.01)
+                with self.lock:
+                    if self.FIN_ACK:
+                        break
+
+        while not self.FIN:
+            time.sleep(0.01)
+
+        # sleep 2 sec because we have to?
         time.sleep(2)
 
-        # Step 5: Stop listener
+        # then close
         self.closed = True
         self.socket.stoprecv()
-        print("Streamer closed cleanly.")
+        self.executor.shutdown(wait=True)
